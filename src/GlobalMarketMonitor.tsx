@@ -17,7 +17,6 @@ type Candidate = {
 };
 
 type TickerRow = { s?: string; c?: string; q?: string };
-
 type HistoryMap = Record<string, Tick[]>;
 
 const pct = (now: number, then?: number) => then && then > 0 ? ((now - then) / then) * 100 : 0;
@@ -63,6 +62,33 @@ function classify(symbol: string, history: Tick[], oiChange: number | null): Can
   if (!reasons.length) reasons.push('cambio incipiente');
 
   return { symbol, direction, score, move10s, move30s, move60s, accel, volumeImpulse, oiChange, reason: reasons.slice(0, 3).join(' · ') };
+}
+
+function directionLabel(direction: Direction) {
+  if (direction === 'LONG') return 'LONG';
+  if (direction === 'SHORT') return 'SHORT';
+  if (direction === 'TRANSITION') return 'TRANSICIÓN';
+  return 'OBSERVAR';
+}
+
+function horizonOf(item: Candidate) {
+  const fastMove = Math.abs(item.move10s);
+  if (item.direction === 'TRANSITION') return '30s–5m';
+  if (item.score >= 88 && fastMove >= 0.10) return '30s–2m';
+  if (item.score >= 76 || Math.abs(item.move30s) >= 0.16) return '2–5m';
+  return '5–15m';
+}
+
+function pendingConfirmations(item: Candidate) {
+  const pending: string[] = [];
+  if (item.direction === 'TRANSITION') pending.push('Definir dirección entre 10s y 30s');
+  if (item.oiChange === null) pending.push('Esperar lectura de Open Interest');
+  else if ((item.direction === 'LONG' || item.direction === 'SHORT') && item.oiChange <= 0) pending.push('OI debe expandirse con el movimiento');
+  if (item.volumeImpulse < 0.35) pending.push('Mayor expansión de volumen');
+  if (Math.abs(item.accel) < 0.03) pending.push('Aceleración todavía débil');
+  if (item.direction === 'LONG' && item.move10s <= 0) pending.push('10s debe volver a positivo');
+  if (item.direction === 'SHORT' && item.move10s >= 0) pending.push('10s debe volver a negativo');
+  return pending.slice(0, 3);
 }
 
 export default function GlobalMarketMonitor() {
@@ -151,11 +177,33 @@ export default function GlobalMarketMonitor() {
     .sort((a, b) => b.score - a.score)
     .slice(0, 10), [history, oi]);
 
+  const leader = candidates.find(x => x.direction !== 'WATCH') ?? candidates[0];
+  const leaderPending = leader ? pendingConfirmations(leader) : [];
+
   return <section className="global-monitor">
     <div className="global-monitor-head">
       <div><span><Radar size={16}/> Radar de mercado global</span><small>{connected ? `Escaneando ${perpetuals.size} perpetuos en vivo` : 'Conectando radar global…'}</small></div>
       <div className={connected ? 'global-live online' : 'global-live'}><Activity size={13}/>{connected ? 'LIVE' : 'OFF'}</div>
     </div>
+
+    <div className={`next-market-move ${leader ? leader.direction.toLowerCase() : 'watch'}`}>
+      <div className="next-market-head"><span>Siguiente movimiento probable</span><b>{leader ? directionLabel(leader.direction) : 'ANALIZANDO'}</b></div>
+      {leader ? <>
+        <div className="next-market-main">
+          <div className="next-market-asset"><small>Cripto líder</small><strong>{leader.symbol.replace('USDT','/USDT')}</strong><span>{leader.reason}</span></div>
+          <div className="next-market-stats">
+            <div><small>Dirección</small><strong>{directionLabel(leader.direction)}</strong></div>
+            <div><small>Confianza</small><strong>{leader.score}%</strong></div>
+            <div><small>Horizonte</small><strong>{horizonOf(leader)}</strong></div>
+          </div>
+        </div>
+        <div className="next-confirmations">
+          <span>Confirmaciones pendientes</span>
+          <div>{leaderPending.length ? leaderPending.map(item => <b key={item}>{item}</b>) : <b className="confirmed">Sin confirmaciones críticas pendientes</b>}</div>
+        </div>
+      </> : <div className="next-market-loading">Reuniendo suficiente historial para identificar el primer movimiento.</div>}
+    </div>
+
     <div className="global-monitor-grid">
       {candidates.slice(0, 6).map(item => <article className={`global-candidate ${item.direction.toLowerCase()}`} key={item.symbol}>
         <div className="global-candidate-top"><div className="global-icon">{item.direction === 'LONG' ? <ArrowUpRight size={18}/> : item.direction === 'SHORT' ? <ArrowDownRight size={18}/> : <Eye size={18}/>}</div><div><strong>{item.symbol.replace('USDT','/USDT')}</strong><small>{item.reason}</small></div><span>{item.score}%</span></div>
@@ -163,6 +211,6 @@ export default function GlobalMarketMonitor() {
         <div className={`global-action ${item.direction.toLowerCase()}`}>{item.direction === 'LONG' ? 'IMPULSO LONG' : item.direction === 'SHORT' ? 'IMPULSO SHORT' : item.direction === 'TRANSITION' ? 'TRANSICIÓN' : 'OBSERVAR'}</div>
       </article>)}
     </div>
-    <p className="global-monitor-note">El radar usa el stream global de Binance para detectar aceleraciones nuevas y consulta Open Interest solo en los candidatos principales. Es una detección de oportunidad, no una garantía de dirección futura.</p>
+    <p className="global-monitor-note">El radar usa datos públicos de Binance para detectar aceleraciones nuevas y consulta Open Interest solo en los candidatos principales. La confianza es un score heurístico de confluencia, no una probabilidad garantizada.</p>
   </section>;
 }
