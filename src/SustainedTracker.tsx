@@ -1,5 +1,5 @@
-import { useEffect, useMemo, useState } from 'react';
-import { Activity, ArrowDownRight, ArrowUpRight, Clock3 } from 'lucide-react';
+import { useEffect, useMemo, useRef, useState } from 'react';
+import { Activity, AlertTriangle, ArrowDownRight, ArrowUpRight, Clock3, Volume2, VolumeX, X } from 'lucide-react';
 
 type Direction = 'LONG' | 'SHORT' | 'NEUTRAL';
 type Reading = {
@@ -23,6 +23,14 @@ type TrackView = {
   oiChange: number;
   regime: string;
   samples: number;
+  reason: string;
+};
+type AlertItem = {
+  id: string;
+  symbol: string;
+  state: TrackState;
+  reason: string;
+  ts: number;
 };
 
 const parseNumber = (value = '') => {
@@ -73,7 +81,20 @@ function classify(history: Reading[]): TrackView | null {
   else if (latest.direction === 'SHORT' && latest.projected >= 58) state = 'POTENCIAL_SHORT';
 
   const score = Math.round(Math.min(99, avgProjected * 0.55 + avgAlignment * 0.25 + consistency * 0.2));
-  return { symbol: latest.symbol, state, score, consistency, projected: latest.projected, move5m: latest.move5m, oiChange: latest.oiChange, regime: latest.regime, samples: recent.length };
+  let reason = 'Sin persistencia suficiente para confirmar dirección.';
+  if (state === 'LONG_SOSTENIDO') {
+    reason = `${longCount}/${recent.length} lecturas LONG, ${consistency}% consistencia, confianza media ${avgProjected.toFixed(0)}%, movimiento 5m ${latest.move5m >= 0 ? '+' : ''}${latest.move5m.toFixed(2)}% y ${latest.regime.toLowerCase()}.`;
+  } else if (state === 'SHORT_SOSTENIDO') {
+    reason = `${shortCount}/${recent.length} lecturas SHORT, ${consistency}% consistencia, confianza media ${avgProjected.toFixed(0)}%, movimiento 5m ${latest.move5m.toFixed(2)}% y ${latest.regime.toLowerCase()}.`;
+  } else if (state === 'TRANSICION') {
+    reason = `Cambio de sesgo detectado: hubo lecturas LONG y SHORT en las últimas 4 muestras. OI ${latest.oiChange >= 0 ? '+' : ''}${latest.oiChange.toFixed(3)}%, 5m ${latest.move5m >= 0 ? '+' : ''}${latest.move5m.toFixed(2)}% y régimen ${latest.regime.toLowerCase()}.`;
+  } else if (state === 'POTENCIAL_LONG') {
+    reason = `Sesgo LONG aún no sostenido: ${longCount}/${recent.length} lecturas, confianza ${latest.projected.toFixed(0)}% y alineación ${latest.alignment.toFixed(0)}%.`;
+  } else if (state === 'POTENCIAL_SHORT') {
+    reason = `Sesgo SHORT aún no sostenido: ${shortCount}/${recent.length} lecturas, confianza ${latest.projected.toFixed(0)}% y alineación ${latest.alignment.toFixed(0)}%.`;
+  }
+
+  return { symbol: latest.symbol, state, score, consistency, projected: latest.projected, move5m: latest.move5m, oiChange: latest.oiChange, regime: latest.regime, samples: recent.length, reason };
 }
 
 function stateLabel(state: TrackState) {
@@ -92,8 +113,51 @@ function tone(state: TrackState) {
   return 'neutral';
 }
 
+function playAlertTone(state: TrackState, ctxRef: React.MutableRefObject<AudioContext | null>) {
+  const AudioCtx = window.AudioContext || (window as typeof window & { webkitAudioContext?: typeof AudioContext }).webkitAudioContext;
+  if (!AudioCtx) return;
+  const ctx = ctxRef.current ?? new AudioCtx();
+  ctxRef.current = ctx;
+  if (ctx.state === 'suspended') void ctx.resume();
+  const now = ctx.currentTime;
+  const frequencies = state === 'LONG_SOSTENIDO' ? [660, 880] : state === 'SHORT_SOSTENIDO' ? [440, 330] : [520, 620, 520];
+  frequencies.forEach((frequency, index) => {
+    const osc = ctx.createOscillator();
+    const gain = ctx.createGain();
+    osc.type = 'sine';
+    osc.frequency.value = frequency;
+    gain.gain.setValueAtTime(0.0001, now + index * 0.13);
+    gain.gain.exponentialRampToValueAtTime(0.08, now + index * 0.13 + 0.015);
+    gain.gain.exponentialRampToValueAtTime(0.0001, now + index * 0.13 + 0.11);
+    osc.connect(gain);
+    gain.connect(ctx.destination);
+    osc.start(now + index * 0.13);
+    osc.stop(now + index * 0.13 + 0.12);
+  });
+}
+
 export default function SustainedTracker() {
   const [history, setHistory] = useState<Record<string, Reading[]>>({});
+  const [alerts, setAlerts] = useState<AlertItem[]>([]);
+  const [soundEnabled, setSoundEnabled] = useState(() => localStorage.getItem('crypto-alert-sound') !== 'off');
+  const previousStates = useRef<Record<string, TrackState>>({});
+  const audioContext = useRef<AudioContext | null>(null);
+
+  useEffect(() => {
+    const unlock = () => {
+      const AudioCtx = window.AudioContext || (window as typeof window & { webkitAudioContext?: typeof AudioContext }).webkitAudioContext;
+      if (!AudioCtx) return;
+      const ctx = audioContext.current ?? new AudioCtx();
+      audioContext.current = ctx;
+      if (ctx.state === 'suspended') void ctx.resume();
+    };
+    window.addEventListener('pointerdown', unlock, { once: true });
+    window.addEventListener('keydown', unlock, { once: true });
+    return () => {
+      window.removeEventListener('pointerdown', unlock);
+      window.removeEventListener('keydown', unlock);
+    };
+  }, []);
 
   useEffect(() => {
     const sample = () => {
@@ -120,26 +184,63 @@ export default function SustainedTracker() {
       return priority(b.state) - priority(a.state) || b.score - a.score;
     }), [history]);
 
+  useEffect(() => {
+    if (!tracked.length) return;
+    const nextPrevious = { ...previousStates.current };
+    const newAlerts: AlertItem[] = [];
+    tracked.forEach(item => {
+      const prev = previousStates.current[item.symbol];
+      nextPrevious[item.symbol] = item.state;
+      const target = item.state === 'LONG_SOSTENIDO' || item.state === 'SHORT_SOSTENIDO' || item.state === 'TRANSICION';
+      if (!prev || prev === item.state || !target) return;
+      newAlerts.push({ id: `${item.symbol}-${item.state}-${Date.now()}`, symbol: item.symbol, state: item.state, reason: item.reason, ts: Date.now() });
+      if (soundEnabled) playAlertTone(item.state, audioContext);
+    });
+    previousStates.current = nextPrevious;
+    if (newAlerts.length) {
+      setAlerts(prev => [...newAlerts, ...prev].slice(0, 4));
+      const ids = newAlerts.map(x => x.id);
+      window.setTimeout(() => setAlerts(prev => prev.filter(x => !ids.includes(x.id))), 12000);
+    }
+  }, [tracked, soundEnabled]);
+
+  const toggleSound = () => {
+    const next = !soundEnabled;
+    setSoundEnabled(next);
+    localStorage.setItem('crypto-alert-sound', next ? 'on' : 'off');
+    if (next) playAlertTone('TRANSICION', audioContext);
+  };
+
   if (!tracked.length) return null;
   const top = tracked[0];
 
-  return <section className="sustained-tracker">
-    <div className="tracker-head">
-      <div><span><Activity size={15}/> Seguimiento sostenido</span><small>6 lecturas recientes · actualización cada 5s</small></div>
-      <div className={`tracker-main-state ${tone(top.state)}`}>{stateLabel(top.state)}</div>
+  return <>
+    <div className="market-alert-stack" aria-live="assertive">
+      {alerts.map(alert => <article className={`market-alert ${tone(alert.state)}`} key={alert.id}>
+        <div className="market-alert-icon">{alert.state === 'LONG_SOSTENIDO' ? <ArrowUpRight size={20}/> : alert.state === 'SHORT_SOSTENIDO' ? <ArrowDownRight size={20}/> : <AlertTriangle size={20}/>}</div>
+        <div className="market-alert-copy"><span>{alert.symbol}</span><strong>{stateLabel(alert.state)}</strong><p>{alert.reason}</p></div>
+        <button aria-label="Cerrar alerta" onClick={() => setAlerts(prev => prev.filter(x => x.id !== alert.id))}><X size={16}/></button>
+      </article>)}
     </div>
-    <div className="tracker-top">
-      <div className={`tracker-icon ${tone(top.state)}`}>{top.state.includes('LONG') ? <ArrowUpRight size={20}/> : top.state.includes('SHORT') ? <ArrowDownRight size={20}/> : <Clock3 size={20}/>}</div>
-      <div className="tracker-top-copy"><strong>{top.symbol}</strong><span>{top.score}% persistencia · {top.consistency}% consistencia</span></div>
-      <div className="tracker-top-metrics"><span>5m <b>{top.move5m >= 0 ? '+' : ''}{top.move5m.toFixed(2)}%</b></span><span>OI <b>{top.oiChange >= 0 ? '+' : ''}{top.oiChange.toFixed(3)}%</b></span></div>
-    </div>
-    <div className="tracker-list">
-      {tracked.slice(0, 6).map(item => <div className="tracker-row" key={item.symbol}>
-        <div><strong>{item.symbol}</strong><small>{item.regime}</small></div>
-        <span className={`tracker-state ${tone(item.state)}`}>{stateLabel(item.state)}</span>
-        <span className="tracker-score">{item.score}%</span>
-      </div>)}
-    </div>
-    <p className="tracker-note">“Sostenido” requiere varias lecturas consecutivas en la misma dirección; una sola señal no basta. El estado puede cambiar cuando precio, OI o flujo pierden confirmación.</p>
-  </section>;
+
+    <section className="sustained-tracker">
+      <div className="tracker-head">
+        <div><span><Activity size={15}/> Seguimiento sostenido</span><small>6 lecturas recientes · actualización cada 5s</small></div>
+        <div className="tracker-actions"><button className={`sound-toggle ${soundEnabled ? 'on' : ''}`} onClick={toggleSound}>{soundEnabled ? <Volume2 size={14}/> : <VolumeX size={14}/>} {soundEnabled ? 'Sonido ON' : 'Sonido OFF'}</button><div className={`tracker-main-state ${tone(top.state)}`}>{stateLabel(top.state)}</div></div>
+      </div>
+      <div className="tracker-top">
+        <div className={`tracker-icon ${tone(top.state)}`}>{top.state.includes('LONG') ? <ArrowUpRight size={20}/> : top.state.includes('SHORT') ? <ArrowDownRight size={20}/> : <Clock3 size={20}/>}</div>
+        <div className="tracker-top-copy"><strong>{top.symbol}</strong><span>{top.score}% persistencia · {top.consistency}% consistencia</span><p>{top.reason}</p></div>
+        <div className="tracker-top-metrics"><span>5m <b>{top.move5m >= 0 ? '+' : ''}{top.move5m.toFixed(2)}%</b></span><span>OI <b>{top.oiChange >= 0 ? '+' : ''}{top.oiChange.toFixed(3)}%</b></span></div>
+      </div>
+      <div className="tracker-list">
+        {tracked.slice(0, 6).map(item => <div className="tracker-row" key={item.symbol}>
+          <div><strong>{item.symbol}</strong><small>{item.reason}</small></div>
+          <span className={`tracker-state ${tone(item.state)}`}>{stateLabel(item.state)}</span>
+          <span className="tracker-score">{item.score}%</span>
+        </div>)}
+      </div>
+      <p className="tracker-note">Las alertas solo se disparan cuando el estado cambia a LONG SOSTENIDO, SHORT SOSTENIDO o TRANSICIÓN; no se repiten en cada refresco. Algunos navegadores requieren una interacción con la página antes de permitir sonido.</p>
+    </section>
+  </>;
 }
