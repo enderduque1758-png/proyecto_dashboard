@@ -1,5 +1,5 @@
 import { useEffect, useMemo, useRef, useState } from 'react';
-import { Activity, ArrowDownRight, ArrowUpRight, Eye, Radar } from 'lucide-react';
+import { Activity, ArrowDownRight, ArrowUpRight, Bell, Eye, Radar, Volume2, VolumeX, X } from 'lucide-react';
 
 type Direction = 'LONG' | 'SHORT' | 'WATCH' | 'TRANSITION';
 type Tick = { price: number; quoteVolume: number; ts: number };
@@ -14,6 +14,14 @@ type Candidate = {
   volumeImpulse: number;
   oiChange: number | null;
   reason: string;
+};
+type LeaderAlert = {
+  id: number;
+  symbol: string;
+  direction: Direction;
+  title: string;
+  reason: string;
+  score: number;
 };
 
 type TickerRow = { s?: string; c?: string; q?: string };
@@ -91,12 +99,40 @@ function pendingConfirmations(item: Candidate) {
   return pending.slice(0, 3);
 }
 
+function playAlertTone(direction: Direction) {
+  try {
+    const AudioCtx = window.AudioContext || (window as typeof window & { webkitAudioContext?: typeof AudioContext }).webkitAudioContext;
+    if (!AudioCtx) return;
+    const ctx = new AudioCtx();
+    const now = ctx.currentTime;
+    const frequencies = direction === 'LONG' ? [660, 880] : direction === 'SHORT' ? [520, 360] : [520, 660, 520];
+    frequencies.forEach((frequency, index) => {
+      const osc = ctx.createOscillator();
+      const gain = ctx.createGain();
+      const start = now + index * 0.12;
+      osc.frequency.value = frequency;
+      osc.type = 'sine';
+      gain.gain.setValueAtTime(0.0001, start);
+      gain.gain.exponentialRampToValueAtTime(0.11, start + 0.015);
+      gain.gain.exponentialRampToValueAtTime(0.0001, start + 0.10);
+      osc.connect(gain);
+      gain.connect(ctx.destination);
+      osc.start(start);
+      osc.stop(start + 0.11);
+    });
+    window.setTimeout(() => ctx.close().catch(() => undefined), 900);
+  } catch { /* audio may be blocked until user interaction */ }
+}
+
 export default function GlobalMarketMonitor() {
   const [perpetuals, setPerpetuals] = useState<Set<string>>(new Set());
   const [history, setHistory] = useState<HistoryMap>({});
   const [oi, setOi] = useState<Record<string, { value: number; change: number | null }>>({});
   const [connected, setConnected] = useState(false);
+  const [soundEnabled, setSoundEnabled] = useState(() => localStorage.getItem('marketLeaderSound') !== 'off');
+  const [alert, setAlert] = useState<LeaderAlert | null>(null);
   const wsRef = useRef<WebSocket | null>(null);
+  const previousLeaderRef = useRef<Candidate | null>(null);
 
   useEffect(() => {
     fetch('https://fapi.binance.com/fapi/v1/exchangeInfo')
@@ -180,10 +216,59 @@ export default function GlobalMarketMonitor() {
   const leader = candidates.find(x => x.direction !== 'WATCH') ?? candidates[0];
   const leaderPending = leader ? pendingConfirmations(leader) : [];
 
+  useEffect(() => {
+    if (!leader) return;
+    const previous = previousLeaderRef.current;
+    if (!previous) {
+      previousLeaderRef.current = leader;
+      return;
+    }
+
+    const leaderChanged = previous.symbol !== leader.symbol;
+    const directionChanged = previous.direction !== leader.direction;
+    const confidenceDelta = leader.score - previous.score;
+    const confidenceChanged = Math.abs(confidenceDelta) >= 5;
+
+    if (leaderChanged || directionChanged || confidenceChanged) {
+      const changes: string[] = [];
+      if (leaderChanged) changes.push(`líder ${previous.symbol.replace('USDT','/USDT')} → ${leader.symbol.replace('USDT','/USDT')}`);
+      if (directionChanged) changes.push(`dirección ${directionLabel(previous.direction)} → ${directionLabel(leader.direction)}`);
+      if (confidenceChanged) changes.push(`confianza ${previous.score}% → ${leader.score}% (${confidenceDelta >= 0 ? '+' : ''}${confidenceDelta})`);
+      const reason = `${changes.join(' · ')}. Señal actual: ${leader.reason}.`;
+      setAlert({ id: Date.now(), symbol: leader.symbol, direction: leader.direction, title: 'Cambió el siguiente movimiento probable', reason, score: leader.score });
+      if (soundEnabled) playAlertTone(leader.direction);
+    }
+    previousLeaderRef.current = leader;
+  }, [leader?.symbol, leader?.direction, leader?.score, leader?.reason, soundEnabled]);
+
+  useEffect(() => {
+    if (!alert) return;
+    const id = window.setTimeout(() => setAlert(null), 12000);
+    return () => window.clearTimeout(id);
+  }, [alert?.id]);
+
+  const toggleSound = () => {
+    setSoundEnabled(value => {
+      const next = !value;
+      localStorage.setItem('marketLeaderSound', next ? 'on' : 'off');
+      if (next) playAlertTone('TRANSITION');
+      return next;
+    });
+  };
+
   return <section className="global-monitor">
+    {alert && <div className={`leader-alert ${alert.direction.toLowerCase()}`} role="status" aria-live="polite">
+      <div className="leader-alert-icon"><Bell size={18}/></div>
+      <div className="leader-alert-copy"><strong>{alert.title}</strong><span>{alert.symbol.replace('USDT','/USDT')} · {directionLabel(alert.direction)} · {alert.score}%</span><p>{alert.reason}</p></div>
+      <button type="button" onClick={() => setAlert(null)} aria-label="Cerrar alerta"><X size={16}/></button>
+    </div>}
+
     <div className="global-monitor-head">
       <div><span><Radar size={16}/> Radar de mercado global</span><small>{connected ? `Escaneando ${perpetuals.size} perpetuos en vivo` : 'Conectando radar global…'}</small></div>
-      <div className={connected ? 'global-live online' : 'global-live'}><Activity size={13}/>{connected ? 'LIVE' : 'OFF'}</div>
+      <div className="global-head-actions">
+        <button type="button" className="global-sound" onClick={toggleSound} title={soundEnabled ? 'Desactivar alertas sonoras' : 'Activar alertas sonoras'}>{soundEnabled ? <Volume2 size={14}/> : <VolumeX size={14}/>}<span>{soundEnabled ? 'Sonido ON' : 'Sonido OFF'}</span></button>
+        <div className={connected ? 'global-live online' : 'global-live'}><Activity size={13}/>{connected ? 'LIVE' : 'OFF'}</div>
+      </div>
     </div>
 
     <div className={`next-market-move ${leader ? leader.direction.toLowerCase() : 'watch'}`}>
@@ -211,6 +296,6 @@ export default function GlobalMarketMonitor() {
         <div className={`global-action ${item.direction.toLowerCase()}`}>{item.direction === 'LONG' ? 'IMPULSO LONG' : item.direction === 'SHORT' ? 'IMPULSO SHORT' : item.direction === 'TRANSITION' ? 'TRANSICIÓN' : 'OBSERVAR'}</div>
       </article>)}
     </div>
-    <p className="global-monitor-note">El radar usa datos públicos de Binance para detectar aceleraciones nuevas y consulta Open Interest solo en los candidatos principales. La confianza es un score heurístico de confluencia, no una probabilidad garantizada.</p>
+    <p className="global-monitor-note">El radar usa datos públicos de Binance para detectar aceleraciones nuevas y consulta Open Interest solo en los candidatos principales. La confianza es un score heurístico de confluencia, no una probabilidad garantizada. Las alertas de confianza se activan a partir de un cambio de 5 puntos.</p>
   </section>;
 }
